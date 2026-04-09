@@ -1,3 +1,5 @@
+import asyncio
+import json
 import os
 
 from fastapi import FastAPI, HTTPException
@@ -12,6 +14,9 @@ from llm import TOP_MOVIES, get_recommendation
 # ---------------------------------------------------------------------------
 
 app = FastAPI(title="Movie Recommender")
+
+TIMEOUT_SECONDS = 5
+VALID_IDS = set(TOP_MOVIES["tmdb_id"].astype(int))
 
 
 class WatchHistoryItem(BaseModel):
@@ -34,28 +39,46 @@ class RecommendResponse(BaseModel):
 # ---------------------------------------------------------------------------
 # DO NOT EDIT: Endpoint
 #
-# Calls get_recommendation() from llm.py and enforces the output contract
-# (valid tmdb_id, description ≤500 chars). Edit llm.py instead.
+# Calls get_recommendation() from llm.py and enforces the output contract.
+# Edit llm.py instead.
 # ---------------------------------------------------------------------------
 
 
 @app.post("/recommend", response_model=RecommendResponse)
-def recommend(request: RecommendRequest):
+async def recommend(request: RecommendRequest):
     if not os.environ.get("OPENAI_API_KEY"):
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY not set")
 
     history_names = [h.name for h in request.history]
+    history_ids = {h.tmdb_id for h in request.history}
+
+    # Rule 3: must respond within 5 seconds
     try:
-        result = get_recommendation(request.preferences, history_names)
+        result = await asyncio.wait_for(
+            asyncio.to_thread(get_recommendation, request.preferences, history_names),
+            timeout=TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail=f"Timed out after {TIMEOUT_SECONDS}s")
+    except json.JSONDecodeError as e:
+        # Rule 6: LLM returned something that isn't valid JSON
+        raise HTTPException(status_code=502, detail=f"LLM returned invalid JSON: {e}")
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"LLM call failed: {e}")
 
-    valid_ids = set(TOP_MOVIES["tmdb_id"].astype(int))
+    # Rule 6: response must be a dict with the expected keys
+    if not isinstance(result, dict) or "tmdb_id" not in result:
+        raise HTTPException(status_code=502, detail="LLM response missing tmdb_id field")
+
     tmdb_id = int(result.get("tmdb_id", -1))
-    if tmdb_id not in valid_ids:
-        raise HTTPException(
-            status_code=502, detail=f"LLM returned invalid tmdb_id: {tmdb_id}"
-        )
+
+    # Rule 5: tmdb_id must be in the candidate list
+    if tmdb_id not in VALID_IDS:
+        raise HTTPException(status_code=502, detail=f"tmdb_id {tmdb_id} is not in the candidate list")
+
+    # Rule 4: must not recommend something the user has already seen
+    if tmdb_id in history_ids:
+        raise HTTPException(status_code=502, detail=f"tmdb_id {tmdb_id} is already in the user's watch history")
 
     description = str(result.get("description", ""))[:500]
 
