@@ -12,14 +12,14 @@ however you like.
 import json
 import os
 
+import ollama
 import pandas as pd
-from openai import OpenAI
 
 # ---------------------------------------------------------------------------
 # TODO: Edit these to improve your recommendations
 # ---------------------------------------------------------------------------
 
-MODEL = "gpt-5-nano"
+MODEL = "gemini-3-flash-preview"
 
 DATA_PATH = os.path.join(os.path.dirname(__file__), "tmdb_top1000_movies.csv")
 TOP_MOVIES = pd.read_csv(DATA_PATH).nlargest(40, "vote_count")
@@ -51,13 +51,16 @@ Respond with ONLY a JSON object — no markdown, no extra text — in this exact
 
 
 def call_llm(prompt: str) -> dict:
-    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-    response = client.chat.completions.create(
+    client = ollama.Client(
+        host="https://ollama.com",
+        headers={"Authorization": f"Bearer {os.environ['OLLAMA_API_KEY']}"},
+    )
+    response = client.chat(
         model=MODEL,
         messages=[{"role": "user", "content": prompt}],
-        response_format={"type": "json_object"},
+        format="json",
     )
-    return json.loads(response.choices[0].message.content)
+    return json.loads(response.message.content)
 
 
 def get_recommendation(preferences: str, history: list[str]) -> dict:

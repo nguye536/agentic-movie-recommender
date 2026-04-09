@@ -4,78 +4,6 @@ A minimal API that recommends a movie based on a user's stated preferences. It p
 
 ---
 
-## Key libraries
-
-### FastAPI
-
-[FastAPI](https://fastapi.tiangolo.com/) is the web framework. It handles routing HTTP requests to Python functions.
-
-The app is created with one line:
-
-```python
-app = FastAPI(title="Movie Recommender")
-```
-
-Routes are declared with decorators. The `@app.post("/recommend")` decorator means: when the server receives a `POST` request to `/recommend`, call the `recommend()` function.
-
-```python
-@app.post("/recommend", response_model=RecommendResponse)
-def recommend(request: RecommendRequest):
-    ...
-```
-
-FastAPI automatically reads the JSON body of the incoming request, validates it against `RecommendRequest`, and serializes the return value to JSON using `RecommendResponse`. You do not need to call `json.loads` or `json.dumps` yourself.
-
-### Pydantic
-
-[Pydantic](https://docs.pydantic.dev/) is what FastAPI uses under the hood to define and enforce data shapes. You declare a class that inherits from `BaseModel`, and Pydantic will automatically parse and validate incoming data against it.
-
-There are three models in this project:
-
-```python
-class WatchHistoryItem(BaseModel):
-    tmdb_id: int
-    name: str
-
-class RecommendRequest(BaseModel):
-    user_id: int
-    preferences: str
-    history: list[WatchHistoryItem] = []   # optional, defaults to empty list
-
-class RecommendResponse(BaseModel):
-    tmdb_id: int
-    user_id: int
-    description: str
-```
-
-If a request arrives with a missing required field (e.g. no `user_id`), or the wrong type (e.g. `user_id` is a string that can't be cast to int), FastAPI will automatically return a `422 Unprocessable Entity` error — you never see that case inside `recommend()`.
-
-### OpenAI (`openai`)
-
-The [`openai`](https://pypi.org/project/openai/) package is the official Python SDK. It handles authentication and the HTTP call to the API.
-
-```python
-from openai import OpenAI
-
-client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-```
-
-Making a call looks like this:
-
-```python
-response = client.chat.completions.create(
-    model="gpt-5-nano",
-    messages=[{"role": "user", "content": prompt}],
-    temperature=0.7,
-    response_format={"type": "json_object"},
-)
-result = json.loads(response.choices[0].message.content)
-```
-
-Setting `response_format` to `{"type": "json_object"}` is called **JSON mode** — it guarantees the model returns valid JSON, so you can call `json.loads` directly without any cleanup.
-
----
-
 ## Running locally
 
 You can run your API on your own laptop to start, for testing purposes.
@@ -89,14 +17,12 @@ pip install -r requirements.txt
 ```
 
 **2. Set your API key**
-You will need to obtain an API key from [here](https://platform.openai.com/api-keys). You will likely need to set up billing. 
-
-Very conservatively, you should be able to generate about 1,000 recommendations for $0.40 USD, and you may be able to obtain complimentary usage by [sharing data ](https://help.openai.com/en/articles/10306912-sharing-feedback-evaluation-and-fine-tuning-data-and-api-inputs-and-outputs-with-openai) with OpenAI. 
+You will need to obtain an API key from [ollama.com/settings/keys](https://ollama.com/settings/keys). A free account is included with Ollama.
 
 You need to bring this API key into your terminal environment, by running the command:
 
 ```bash
-export OPENAI_API_KEY=your_openai_api_key_here
+export OLLAMA_API_KEY=your_ollama_api_key_here
 ```
 
 **3. Start the server**
@@ -159,7 +85,7 @@ run:
 
 **3. Set your API key secret in the Leapcell dashboard.**
 
-Go to your service's **Environment Variables** settings and add `OPENAI_API_KEY` with your key as the value. Do not commit the key to your repo.
+Go to your service's **Environment Variables** settings and add `OLLAMA_API_KEY` with your key as the value. Do not commit the key to your repo.
 
 **4. Deploy.**
 
@@ -176,3 +102,77 @@ Some ideas to get you started:
 - Use the watch history to steer away from movies too similar to ones already seen.
 - Experiment with prompt phrasing — chain-of-thought or few-shot examples often improve output quality.
 - Cache responses for identical inputs to stay safely under the 5-second deadline.
+
+---
+
+## Key libraries
+
+### FastAPI
+
+[FastAPI](https://fastapi.tiangolo.com/) is the web framework. It handles routing HTTP requests to Python functions.
+
+The app is created with one line:
+
+```python
+app = FastAPI(title="Movie Recommender")
+```
+
+Routes are declared with decorators. The `@app.post("/recommend")` decorator means: when the server receives a `POST` request to `/recommend`, call the `recommend()` function.
+
+```python
+@app.post("/recommend", response_model=RecommendResponse)
+def recommend(request: RecommendRequest):
+    ...
+```
+
+FastAPI automatically reads the JSON body of the incoming request, validates it against `RecommendRequest`, and serializes the return value to JSON using `RecommendResponse`. You do not need to call `json.loads` or `json.dumps` yourself.
+
+### Pydantic
+
+[Pydantic](https://docs.pydantic.dev/) is what FastAPI uses under the hood to define and enforce data shapes. You declare a class that inherits from `BaseModel`, and Pydantic will automatically parse and validate incoming data against it.
+
+There are three models in this project:
+
+```python
+class WatchHistoryItem(BaseModel):
+    tmdb_id: int
+    name: str
+
+class RecommendRequest(BaseModel):
+    user_id: int
+    preferences: str
+    history: list[WatchHistoryItem] = []   # optional, defaults to empty list
+
+class RecommendResponse(BaseModel):
+    tmdb_id: int
+    user_id: int
+    description: str
+```
+
+If a request arrives with a missing required field (e.g. no `user_id`), or the wrong type (e.g. `user_id` is a string that can't be cast to int), FastAPI will automatically return a `422 Unprocessable Entity` error — you never see that case inside `recommend()`.
+
+### Ollama (`ollama`)
+
+The [`ollama`](https://pypi.org/project/ollama/) package is the official Python SDK. It handles authentication and the HTTP call to the Ollama cloud API.
+
+```python
+import ollama
+
+client = ollama.Client(
+    host="https://ollama.com",
+    headers={"Authorization": f"Bearer {os.environ['OLLAMA_API_KEY']}"},
+)
+```
+
+Making a call looks like this:
+
+```python
+response = client.chat(
+    model="gemini-3-flash-preview",
+    messages=[{"role": "user", "content": prompt}],
+    format="json",
+)
+result = json.loads(response.message.content)
+```
+
+Setting `format="json"` is Ollama's **JSON mode** — it instructs the model to return valid JSON, so you can call `json.loads` directly without any cleanup.
