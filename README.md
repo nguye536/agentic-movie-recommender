@@ -57,6 +57,18 @@ curl -X POST http://localhost:8000/recommend \
 
 Note that the port (8000 here) must be the same one that your app is listening on.
 
+**Quick CLI test (optional)**
+
+You can also test your recommendation logic directly without running the API:
+
+```bash
+python llm.py \
+  --preferences "I want a funny, light, action-packed movie." \
+  --history "The Avengers,Iron Man"
+```
+
+If you omit either `--preferences` or `--history`, `llm.py` will ask for that value interactively.
+
 ---
 
 ## Deploying to Leapcell

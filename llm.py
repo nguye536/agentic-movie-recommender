@@ -12,6 +12,7 @@ however you like.
 import json
 import os
 import time
+import argparse
 
 import ollama
 import pandas as pd
@@ -32,7 +33,9 @@ def get_recommendation(preferences: str, history: list[str]) -> dict:
         f'- tmdb_id={row.tmdb_id} | "{row.title}" ({row.year}) | genres: {row.genres} | overview: {row.overview[:200]}'
         for row in TOP_MOVIES.itertuples()
     )
-    history_text = ", ".join(f'"{name}"' for name in history) if history else "none"
+    history_text = (
+        ", ".join(f'"{name}"' for name in history) if history else "none"
+    )
     prompt = f"""You are a movie recommendation assistant.
 
 A user is looking for a movie to watch. Here are their preferences:
@@ -65,21 +68,47 @@ Respond with ONLY a JSON object — no markdown, no extra text — in this exact
 
 
 if __name__ == "__main__":
-    print("Movie recommender – type your preferences and press Enter.")
-    print("For watch history, enter comma-separated movie titles (or leave blank).")
+    parser = argparse.ArgumentParser(
+        description="Run a local movie recommendation test."
+    )
+    parser.add_argument(
+        "--preferences",
+        type=str,
+        help="User preferences text. If omitted, you will be prompted.",
+    )
+    parser.add_argument(
+        "--history",
+        type=str,
+        help='Comma-separated watch history titles. Example: "The Avengers, Up"',
+    )
+    args = parser.parse_args()
 
-    preferences = input("Preferences: ").strip()
-    history_raw = input("Watch history (optional): ").strip()
-    history = [t.strip() for t in history_raw.split(",")] if history_raw else []
+    print("Movie recommender – type your preferences and press Enter.")
+    print(
+        "For watch history, enter comma-separated movie titles (or leave blank)."
+    )
+
+    preferences = (
+        args.preferences.strip()
+        if args.preferences and args.preferences.strip()
+        else input("Preferences: ").strip()
+    )
+    history_raw = (
+        args.history.strip()
+        if args.history and args.history.strip()
+        else input("Watch history (optional): ").strip()
+    )
+    history = (
+        [t.strip() for t in history_raw.split(",") if t.strip()]
+        if history_raw
+        else []
+    )
 
     print("\nThinking...\n")
     start = time.perf_counter()
     result = get_recommendation(preferences, history)
+    print(result)
     elapsed = time.perf_counter() - start
 
-    match = TOP_MOVIES[TOP_MOVIES["tmdb_id"] == result["tmdb_id"]]
-    title = match.iloc[0]["title"] if not match.empty else "unknown"
-
-    print(f"Recommendation: {title} (tmdb_id={result['tmdb_id']})")
-    print(f"\n{result['description']}")
     print(f"\nServed in {elapsed:.2f}s")
+
