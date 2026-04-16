@@ -79,29 +79,10 @@ To play the game in class, you will need to have deployed your app publicly so t
 
 You will need a free leapcell account, and you will need to [connect it to your Github account](https://docs.leapcell.io/service/connect-to-github/).
 
-To deploy your app to Leapcell, follow the steps:
+To deploy your app to Leapcell, follow these steps:
 
-
-**1. Push your code to GitHub.**
-
-**2. Create a new service on Leapcell.**
-
-Connect your GitHub repo. Leapcell will detect `leapcell.yaml` and use it for build and run:
-
-```yaml
-build:
-  buildCommand: pip install -r requirements.txt
-run:
-  runCommand: uvicorn main:app --host 0.0.0.0 --port 8080
-```
-
-**3. Set your API key secret in the Leapcell dashboard.**
-
-Go to your service's **Environment Variables** settings and add `OLLAMA_API_KEY` with your key as the value. Do not commit the key to your repo.
-
-**4. Deploy.**
-
-Leapcell will install dependencies, start the server, and give you a public URL. Submit that URL as your API endpoint.
+![](./leapcell-instructions-1.png)
+![](./leapcell-instructions-2.png)
 
 ---
 
