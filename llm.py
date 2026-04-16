@@ -11,6 +11,7 @@ however you like.
 
 import json
 import os
+import time
 
 import ollama
 import pandas as pd
@@ -19,10 +20,10 @@ import pandas as pd
 # TODO: Edit these to improve your recommendations
 # ---------------------------------------------------------------------------
 
-MODEL = "gemini-3-flash-preview"
+MODEL = "gemma4:31b-cloud"
 
 DATA_PATH = os.path.join(os.path.dirname(__file__), "tmdb_top1000_movies.csv")
-TOP_MOVIES = pd.read_csv(DATA_PATH).nlargest(40, "vote_count")
+TOP_MOVIES = pd.read_csv(DATA_PATH).nlargest(5, "vote_count")
 
 
 def get_recommendation(preferences: str, history: list[str]) -> dict:
@@ -49,6 +50,7 @@ Respond with ONLY a JSON object — no markdown, no extra text — in this exact
   "tmdb_id": <integer>,
   "description": "<a compelling blurb ≤500 chars that tells the user why this movie matches their preferences>"
 }}"""
+    print(prompt)
 
     client = ollama.Client(
         host="https://ollama.com",
@@ -65,17 +67,19 @@ Respond with ONLY a JSON object — no markdown, no extra text — in this exact
 if __name__ == "__main__":
     print("Movie recommender – type your preferences and press Enter.")
     print("For watch history, enter comma-separated movie titles (or leave blank).")
-    print()
 
     preferences = input("Preferences: ").strip()
     history_raw = input("Watch history (optional): ").strip()
     history = [t.strip() for t in history_raw.split(",")] if history_raw else []
 
     print("\nThinking...\n")
+    start = time.perf_counter()
     result = get_recommendation(preferences, history)
+    elapsed = time.perf_counter() - start
 
     match = TOP_MOVIES[TOP_MOVIES["tmdb_id"] == result["tmdb_id"]]
     title = match.iloc[0]["title"] if not match.empty else "unknown"
 
     print(f"Recommendation: {title} (tmdb_id={result['tmdb_id']})")
     print(f"\n{result['description']}")
+    print(f"\nServed in {elapsed:.2f}s")
