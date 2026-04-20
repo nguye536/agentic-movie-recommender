@@ -28,8 +28,14 @@ import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 import ollama
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
+
+# Optional ML imports — lazy load to handle deployment environments
+try:
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.metrics.pairwise import cosine_similarity
+    HAS_SKLEARN = True
+except ImportError:
+    HAS_SKLEARN = False
 
 load_dotenv()
 
@@ -115,18 +121,32 @@ if not os.environ.get("USE_TFIDF"):
         print(f"[retrieval] sentence-transformers unavailable ({e}), using TF-IDF")
 
 # TF-IDF fallback (always built; used if sentence-transformers failed)
-_tfidf_vec = TfidfVectorizer(ngram_range=(1, 2), stop_words="english", max_features=10000)
-_tfidf_matrix = _tfidf_vec.fit_transform(_embed_texts)
+_tfidf_vec = None
+_tfidf_matrix = None
+
+if HAS_SKLEARN:
+    _tfidf_vec = TfidfVectorizer(ngram_range=(1, 2), stop_words="english", max_features=10000)
+    _tfidf_matrix = _tfidf_vec.fit_transform(_embed_texts)
 
 
 def _semantic_scores(query: str) -> np.ndarray:
     """Return per-movie cosine similarity scores for the query string."""
     if _st_model is not None and _st_embeddings is not None:
         q_emb = _st_model.encode([query])
+        from sklearn.metrics.pairwise import cosine_similarity
         return cosine_similarity(q_emb, _st_embeddings)[0]
-    else:
+    elif HAS_SKLEARN and _tfidf_vec is not None and _tfidf_matrix is not None:
         q_vec = _tfidf_vec.transform([query])
+        from sklearn.metrics.pairwise import cosine_similarity
         return cosine_similarity(q_vec, _tfidf_matrix)[0]
+    else:
+        # Fallback: simple keyword matching when sklearn unavailable
+        query_lower = query.lower()
+        scores = np.array([
+            sum(1 for word in query_lower.split() if word in _safe(row.get("overview", "")).lower())
+            for _, row in DF.iterrows()
+        ], dtype=float)
+        return scores / (np.max(scores) + 1e-9) if np.max(scores) > 0 else scores
 
 
 def _quality_scores(df: pd.DataFrame) -> np.ndarray:
