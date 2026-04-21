@@ -23,7 +23,6 @@ import time
 import random
 import argparse
 from collections import defaultdict
-from functools import lru_cache
 
 import numpy as np
 import pandas as pd
@@ -104,9 +103,11 @@ def _tokenize(text: str) -> list[str]:
 _token_docs = [_tokenize(d) for d in _docs]
 _N = len(_token_docs)
 _df_counts: dict = defaultdict(int)
-for _d in _token_docs:
+_token_to_docs: dict[str, list[int]] = defaultdict(list)  # token → doc indices
+for _i, _d in enumerate(_token_docs):
     for _t in set(_d):
         _df_counts[_t] += 1
+        _token_to_docs[_t].append(_i)
 _idf: dict = {t: math.log(_N / (c + 1)) for t, c in _df_counts.items()}
 
 def _tfidf_scores(query: str) -> np.ndarray:
@@ -139,15 +140,16 @@ else:
 def _semantic_scores(query: str) -> np.ndarray:
     if _doc_embeddings is None:
         return _tfidf_scores(query)
-    # Build query pseudo-vector: IDF-weighted average of doc vectors that
-    # share terms with the query. No embed API call needed.
     q_tokens = _tokenize(query)
     if not q_tokens:
         return np.zeros(_N, dtype=np.float32)
+    # Sparse accumulation: only touch docs that share tokens with the query
     weights = np.zeros(_N, dtype=np.float32)
-    for i, doc in enumerate(_token_docs):
-        doc_set = set(doc)
-        weights[i] = sum(_idf.get(t, 0.0) for t in q_tokens if t in doc_set)
+    for t in q_tokens:
+        idf = _idf.get(t, 0.0)
+        if idf > 0:
+            for doc_i in _token_to_docs.get(t, []):
+                weights[doc_i] += idf
     w_sum = weights.sum()
     if w_sum < 1e-9:
         return _tfidf_scores(query)
@@ -330,15 +332,15 @@ def _movie_card(row) -> str:
 # Ollama client + retry
 # ---------------------------------------------------------------------------
 
-DEADLINE_SECS = 18.0   # hard budget; grader kills at 20s
-
-def _get_client() -> ollama.Client:
+def _make_client() -> ollama.Client:
     import httpx
     return ollama.Client(
         host="https://ollama.com",
         headers={"Authorization": f"Bearer {os.environ['OLLAMA_API_KEY']}"},
         timeout=httpx.Timeout(19.0),
     )
+
+_client: ollama.Client = _make_client()
 
 def _call_llm(prompt: str, client: ollama.Client, max_retries: int = 2) -> str:
     for attempt in range(max_retries):
@@ -440,7 +442,6 @@ def get_recommendation(preferences: str, history: list[str], history_ids: list[i
         return _response_cache[cache_key]
 
     t_start = time.perf_counter()
-    client = _get_client()
 
     candidates = retrieve_candidates(preferences, history_ids, history)
     valid_ids = set(candidates["tmdb_id"].tolist())
@@ -450,9 +451,9 @@ def get_recommendation(preferences: str, history: list[str], history_ids: list[i
     history_text = (
         ", ".join(f'"{n}"' for n in history) if history else "none"
     )
-    movie_list = "\n\n".join(
-        f"  [{idx+1}]\n    {_movie_card(row)}"
-        for idx, (_, row) in enumerate(candidates.iterrows())
+    movie_list = "\n".join(
+        f"  tmdb_id={int(row['tmdb_id'])} | {_safe(row['title'])} ({int(row['year']) if pd.notna(row.get('year')) else '?'}) | {_safe(row['genres'])} | {_safe(row['overview'], 80)}"
+        for _, row in candidates.iterrows()
     )
 
     # Stage 1 — pick tmdb_id
@@ -460,7 +461,7 @@ def get_recommendation(preferences: str, history: list[str], history_ids: list[i
         preferences=preferences,
         history_text=history_text,
         movie_list=movie_list,
-    ), client)
+    ), _client)
 
     data1 = _parse_json(raw1)
     if not data1 or "tmdb_id" not in data1:
@@ -480,7 +481,7 @@ def get_recommendation(preferences: str, history: list[str], history_ids: list[i
         preferences=preferences,
         movie_card=_movie_card(selected_row),
         tone_instruction=tone_instruction,
-    ), client)
+    ), _client)
 
     data2 = _parse_json(raw2)
     if not data2 or "description" not in data2:
