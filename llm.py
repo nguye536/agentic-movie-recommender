@@ -463,13 +463,23 @@ def get_recommendation(preferences: str, history: list[str], history_ids: list[i
         print(f"[warn] id {tmdb_id} not in candidates — using top candidate")
         tmdb_id = int(candidates.iloc[0]["tmdb_id"])
 
-    # Warn if description appears to be about a different movie
-    selected_title = _safe(candidates[candidates["tmdb_id"] == tmdb_id].iloc[0]["title"]).lower()
-    other_titles = [_safe(r["title"]).lower() for _, r in candidates.iterrows() if int(r["tmdb_id"]) != tmdb_id]
-    if not any(word in description.lower() for word in selected_title.split() if len(word) > 3):
-        for other in other_titles:
-            if any(word in description.lower() for word in other.split() if len(word) > 4):
-                print(f"[warn] description mentions '{other}' instead of '{selected_title}' — mismatch likely")
+    # Validate description is actually about the selected movie.
+    # Score overlap between description tokens and the movie's overview tokens.
+    selected_row = candidates[candidates["tmdb_id"] == tmdb_id].iloc[0]
+    overview_tokens = set(_tokenize(_safe(selected_row.get("overview", ""))))
+    desc_tokens = set(_tokenize(description))
+    overlap = len(desc_tokens & overview_tokens)
+    # Also flag if another candidate's title words dominate the description
+    other_titles = [_safe(r["title"]) for _, r in candidates.iterrows() if int(r["tmdb_id"]) != tmdb_id]
+    hallucinated = any(
+        sum(1 for w in _title_tokens(t) if w in description.lower()) >= 2
+        for t in other_titles
+    )
+    if hallucinated or (overlap < 2 and len(overview_tokens) > 5):
+        print(f"[warn] description mismatch for '{_safe(selected_row['title'])}' — using overview fallback")
+        genres = _safe(selected_row.get("genres", ""))
+        overview = _safe(selected_row.get("overview", ""), 300)
+        description = f"{overview} ({genres})".strip()[:460]
 
     elapsed = time.perf_counter() - t_start
     print(f"[timing] total: {elapsed:.1f}s")
