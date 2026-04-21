@@ -11,6 +11,8 @@ import os
 import numpy as np
 import pandas as pd
 import ollama
+import time
+import random
 
 EMBED_MODEL = "nomic-embed-text"   # fast, high-quality, available on Ollama Cloud
 
@@ -46,14 +48,29 @@ def build_doc(row):
 docs = [build_doc(row) for _, row in df.iterrows()]
 print(f"Embedding {len(docs)} movies with {EMBED_MODEL}...")
 
-# Embed in batches of 32
+# Embed in batches of 32 with retry logic
 all_embeddings = []
 batch_size = 32
+max_retries = 3
+
 for i in range(0, len(docs), batch_size):
     batch = docs[i:i+batch_size]
-    resp = client.embed(model=EMBED_MODEL, input=batch)
-    all_embeddings.extend(resp["embeddings"])
-    print(f"  {min(i+batch_size, len(docs))}/{len(docs)} done")
+    
+    # Retry logic with exponential backoff
+    for attempt in range(max_retries):
+        try:
+            resp = client.embed(model=EMBED_MODEL, input=batch)
+            all_embeddings.extend(resp["embeddings"])
+            print(f"  {min(i+batch_size, len(docs))}/{len(docs)} done")
+            break
+        except Exception as e:
+            if attempt < max_retries - 1:
+                wait = 2 ** attempt + random.uniform(0, 1)
+                print(f"  Retry batch {i//batch_size + 1} in {wait:.1f}s ({type(e).__name__})")
+                time.sleep(wait)
+            else:
+                print(f"  ERROR: Failed after {max_retries} retries — {e}")
+                raise
 
 embeddings = np.array(all_embeddings, dtype=np.float32)
 
