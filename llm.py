@@ -173,7 +173,7 @@ def _quality_scores() -> np.ndarray:
 _qual = _quality_scores()
 
 # ---------------------------------------------------------------------------
-# Fuzzy title matching — resolves partial/approximate movie names to tmdb_ids
+# Inverted indices — built once at load time, O(1) lookups at query time
 # ---------------------------------------------------------------------------
 
 _TITLE_STOPWORDS = {"the", "a", "an", "and", "or", "of", "in", "on", "at", "to"}
@@ -181,39 +181,70 @@ _TITLE_STOPWORDS = {"the", "a", "an", "and", "or", "of", "in", "on", "at", "to"}
 def _title_tokens(s: str) -> set[str]:
     return set(re.sub(r"[^a-z0-9\s]", " ", s.lower()).split()) - _TITLE_STOPWORDS
 
+# token → list of (row_index, tmdb_id, title, year)
+_title_index: dict[str, list[tuple]] = defaultdict(list)
+# word → set of row indices
+_director_index: dict[str, set] = defaultdict(set)
+_cast_index: dict[str, set] = defaultdict(set)
+# genre string → set of row indices
+_genre_index: dict[str, set] = defaultdict(set)
+# row_index → tmdb_id (fast exclusion)
+_row_to_tmdb: list[int] = []
+
+for _i, (_, _row) in enumerate(DF.iterrows()):
+    _tid = int(_row["tmdb_id"])
+    _title = _safe(_row.get("title", ""))
+    _year = int(_row["year"]) if pd.notna(_row.get("year")) else 0
+    _row_to_tmdb.append(_tid)
+
+    for _tok in _title_tokens(_title):
+        _title_index[_tok].append((_i, _tid, _title, _year))
+
+    for _word in re.findall(r"[a-z]{4,}", _safe(_row.get("director", "")).lower()):
+        _director_index[_word].add(_i)
+
+    for _word in re.findall(r"[a-z]{4,}", _safe(_row.get("top_cast", ""), 100).lower()):
+        _cast_index[_word].add(_i)
+
+    for _g in re.split(r"[,|/]", _safe(_row.get("genres", "")).lower()):
+        _g = _g.strip()
+        if _g:
+            _genre_index[_g].add(_i)
+
+_row_to_tmdb = np.array(_row_to_tmdb, dtype=np.int64)
+
+# ---------------------------------------------------------------------------
+# Fuzzy title matching — O(1) index lookups, no full scan
+# ---------------------------------------------------------------------------
+
 def fuzzy_match_title(name: str) -> int:
     """Return tmdb_id of best fuzzy match for a partial/misspelled title, or 0."""
     q = _title_tokens(name)
     if not q:
         return 0
-    best_id, best_score = 0, 0.0
-    for _, row in DF.iterrows():
-        t = _title_tokens(_safe(row.get("title", "")))
-        if not t:
-            continue
-        overlap = len(q & t)
-        score = overlap / len(q)  # fraction of query words found in title
-        if score > best_score:
-            best_score, best_id = score, int(row["tmdb_id"])
-    return best_id if best_score >= 0.6 else 0
+    overlap_counts: dict[int, int] = defaultdict(int)
+    for tok in q:
+        for row_i, tid, _, _ in _title_index.get(tok, []):
+            overlap_counts[row_i] += 1
+    if not overlap_counts:
+        return 0
+    best_i = max(overlap_counts, key=lambda i: overlap_counts[i] / len(q))
+    best_score = overlap_counts[best_i] / len(q)
+    return int(_row_to_tmdb[best_i]) if best_score >= 0.6 else 0
 
 def fuzzy_search_titles(query: str, limit: int = 5) -> list[dict]:
     """Return top matching movies for a partial title query."""
     q = _title_tokens(query)
     if not q:
         return []
-    scored = []
-    for _, row in DF.iterrows():
-        t = _title_tokens(_safe(row.get("title", "")))
-        if not t:
-            continue
-        overlap = len(q & t)
-        if overlap == 0:
-            continue
-        score = overlap / len(q)
-        scored.append((score, int(row["tmdb_id"]), _safe(row["title"]), int(row["year"]) if pd.notna(row.get("year")) else 0))
-    scored.sort(reverse=True)
-    return [{"tmdb_id": tid, "title": title, "year": year} for _, tid, title, year in scored[:limit]]
+    overlap_counts: dict[int, int] = defaultdict(int)
+    meta: dict[int, tuple] = {}
+    for tok in q:
+        for row_i, tid, title, year in _title_index.get(tok, []):
+            overlap_counts[row_i] += 1
+            meta[row_i] = (tid, title, year)
+    scored = sorted(overlap_counts, key=lambda i: overlap_counts[i] / len(q), reverse=True)
+    return [{"tmdb_id": meta[i][0], "title": meta[i][1], "year": meta[i][2]} for i in scored[:limit]]
 
 # ---------------------------------------------------------------------------
 # Candidate retrieval
@@ -232,29 +263,27 @@ def retrieve_candidates(preferences: str, history_ids: list[int], history_names:
     combined = 0.70 * sem_norm + 0.30 * _qual
 
     prefs_lower = preferences.lower()
+    prefs_words = set(re.findall(r"[a-z]{4,}", prefs_lower))
 
-    # Director/actor boost
+    # Director/cast boost via index lookup
     director_boost = np.zeros(len(DF), dtype=np.float32)
     cast_boost = np.zeros(len(DF), dtype=np.float32)
-    # Genre boost: when user says "action movie", prioritise actual action films
+    for word in prefs_words:
+        for i in _director_index.get(word, set()):
+            director_boost[i] = 0.4
+        for i in _cast_index.get(word, set()):
+            cast_boost[i] = 0.2
+
+    # Genre boost via index lookup
     genre_boost = np.zeros(len(DF), dtype=np.float32)
-    for i, (_, row) in enumerate(DF.iterrows()):
-        director = _safe(row.get("director", "")).lower()
-        cast = _safe(row.get("top_cast", "")).lower()
-        genres = _safe(row.get("genres", "")).lower()
-        for word in re.findall(r"[a-z]{4,}", prefs_lower):
-            if word in director:
-                director_boost[i] = 0.4
-            if word in cast:
-                cast_boost[i] = 0.2
-        for gkw in _GENRE_KEYWORDS:
-            if gkw in prefs_lower and gkw in genres:
+    for gkw in _GENRE_KEYWORDS:
+        if gkw in prefs_lower:
+            for i in _genre_index.get(gkw, set()):
                 genre_boost[i] = 0.25
-                break
 
     combined = combined + director_boost + cast_boost + genre_boost
 
-    # Build exclusion set: explicit ids + fuzzy-matched names for unresolved (id=0) entries
+    # Build exclusion set: explicit ids + fuzzy-resolved names when tmdb_id=0
     history_set = set(history_ids)
     for name, hid in zip(history_names, history_ids):
         if hid == 0 and name:
@@ -262,13 +291,10 @@ def retrieve_candidates(preferences: str, history_ids: list[int], history_names:
             if resolved:
                 history_set.add(resolved)
 
-    scored = [
-        (float(combined[i]), i)
-        for i, (_, row) in enumerate(DF.iterrows())
-        if int(row["tmdb_id"]) not in history_set
-    ]
-    scored.sort(reverse=True)
-    return DF.iloc[[i for _, i in scored[:k]]].copy()
+    mask = np.isin(_row_to_tmdb, list(history_set), invert=True)
+    indices = np.where(mask)[0]
+    top_k = indices[np.argsort(combined[indices])[::-1][:k]]
+    return DF.iloc[top_k].copy()
 
 # ---------------------------------------------------------------------------
 # Mood detection
