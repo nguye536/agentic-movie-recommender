@@ -4,14 +4,11 @@ Movie recommendation agent.
 Required environment variables:
   OLLAMA_API_KEY  — injected by grader at runtime
 
-Setup (run once locally, then commit movie_embeddings.npy to your repo):
-  OLLAMA_API_KEY=your_key python generate_embeddings.py
-
 Strategy:
-  1. Semantic retrieval  — pre-computed Ollama embeddings (nomic-embed-text),
-                           loaded from movie_embeddings.npy at startup.
-                           Query embedded at request time via one Ollama API call.
-                           Falls back to TF-IDF if .npy not found.
+  1. Semantic retrieval  — pre-computed sentence-transformer embeddings loaded
+                           from movie_embeddings.npy. Query matched via IDF-weighted
+                           pseudo-vector (no embed API call needed at runtime).
+                           Falls back to pure TF-IDF if .npy not found.
   2. Popularity re-rank  — blends semantic score (70%) with vote quality (30%)
   3. Rich movie fields   — tagline, director, cast, rating, runtime, keywords
   4. Two-stage LLM       — Stage 1 picks tmdb_id; Stage 2 writes description
@@ -100,53 +97,7 @@ def _get_client() -> ollama.Client:
     )
 
 # ---------------------------------------------------------------------------
-# Semantic retrieval — pre-computed embeddings + TF-IDF query embedding
-# ---------------------------------------------------------------------------
-
-_doc_embeddings: np.ndarray | None = None
-
-if os.path.exists(EMBED_CACHE_PATH):
-    _doc_embeddings = np.load(EMBED_CACHE_PATH).astype(np.float32)
-    print(f"[embed] loaded {_doc_embeddings.shape[0]} movie embeddings")
-else:
-    print("[embed] movie_embeddings.npy not found — run generate_embeddings.py locally and commit the file")
-
-def _query_embedding_tfidf(query: str) -> np.ndarray:
-    """Convert query to a sparse TF-IDF vector in the same space as doc embeddings."""
-    q_tokens = _tokenize(query)
-    if not q_tokens:
-        return np.zeros(_doc_embeddings.shape[1], dtype=np.float32)
-    
-    # Build TF-IDF vector for query
-    q_vec = np.zeros(len(_idf), dtype=np.float32)
-    token_to_idx = {t: i for i, t in enumerate(sorted(_idf.keys()))}
-    
-    for token in q_tokens:
-        if token in token_to_idx:
-            q_vec[token_to_idx[token]] = _idf.get(token, 0.0)
-    
-    # Normalize to unit length
-    norm = np.linalg.norm(q_vec)
-    if norm > 0:
-        q_vec /= norm
-    
-    return q_vec
-
-def _semantic_scores(query: str, client: ollama.Client = None) -> np.ndarray:
-    """Score movies using pre-computed semantic embeddings."""
-    if _doc_embeddings is not None:
-        # Use TF-IDF to embed the query (no API call needed)
-        q = _query_embedding_tfidf(query)
-        # Pad or trim q to match embedding dimension if needed
-        if len(q) < _doc_embeddings.shape[1]:
-            q = np.pad(q, (0, _doc_embeddings.shape[1] - len(q)))
-        elif len(q) > _doc_embeddings.shape[1]:
-            q = q[:_doc_embeddings.shape[1]]
-        return _doc_embeddings @ q  # dot product = cosine similarity (both normalised)
-    return _tfidf_scores(query)  # fallback to full TF-IDF
-
-# ---------------------------------------------------------------------------
-# TF-IDF fallback (pure Python, no packages)
+# TF-IDF index (pure Python, used for both fallback and query matching)
 # ---------------------------------------------------------------------------
 
 STOPWORDS = {
@@ -181,6 +132,41 @@ def _tfidf_scores(query: str) -> np.ndarray:
             tf[t] += 1
         scores[i] = sum((tf[t] / len(doc)) * _idf.get(t, 0.0) for t in q_tokens if t in tf)
     return scores
+
+# ---------------------------------------------------------------------------
+# Semantic retrieval — pre-computed embeddings, no API call at query time
+# Query is represented as IDF-weighted average of matching document vectors
+# ---------------------------------------------------------------------------
+
+_doc_embeddings: np.ndarray | None = None
+
+if os.path.exists(EMBED_CACHE_PATH):
+    _doc_embeddings = np.load(EMBED_CACHE_PATH).astype(np.float32)
+    print(f"[embed] loaded {_doc_embeddings.shape[0]} movie embeddings")
+else:
+    print("[embed] movie_embeddings.npy not found — using TF-IDF")
+
+def _semantic_scores(query: str) -> np.ndarray:
+    if _doc_embeddings is None:
+        return _tfidf_scores(query)
+    # Build query pseudo-vector: IDF-weighted average of doc vectors that
+    # share terms with the query. No embed API call needed.
+    q_tokens = _tokenize(query)
+    if not q_tokens:
+        return np.zeros(_N, dtype=np.float32)
+    weights = np.zeros(_N, dtype=np.float32)
+    for i, doc in enumerate(_token_docs):
+        doc_set = set(doc)
+        weights[i] = sum(_idf.get(t, 0.0) for t in q_tokens if t in doc_set)
+    w_sum = weights.sum()
+    if w_sum < 1e-9:
+        return _tfidf_scores(query)
+    query_vec = (weights[:, None] * _doc_embeddings).sum(axis=0) / w_sum
+    norm = np.linalg.norm(query_vec)
+    if norm < 1e-9:
+        return _tfidf_scores(query)
+    query_vec /= norm
+    return (_doc_embeddings @ query_vec).astype(np.float32)
 
 # ---------------------------------------------------------------------------
 # Quality scores
