@@ -23,6 +23,7 @@ import time
 import random
 import argparse
 from collections import defaultdict
+from functools import lru_cache
 
 import numpy as np
 import pandas as pd
@@ -180,6 +181,23 @@ def retrieve_candidates(preferences: str, history_ids: list[int], k: int = TOP_K
     s_min, s_max = sem.min(), sem.max()
     sem_norm = (sem - s_min) / (s_max - s_min + 1e-9)
     combined = 0.70 * sem_norm + 0.30 * _qual
+
+    # Director/actor boost: if preferences mention a name that matches director or cast, boost those films
+    prefs_lower = preferences.lower()
+    director_boost = np.zeros(len(DF), dtype=np.float32)
+    cast_boost = np.zeros(len(DF), dtype=np.float32)
+    for i, (_, row) in enumerate(DF.iterrows()):
+        director = _safe(row.get("director", "")).lower()
+        cast = _safe(row.get("top_cast", "")).lower()
+        # Check if any word 4+ chars from preferences matches director or cast
+        for word in re.findall(r"[a-z]{4,}", prefs_lower):
+            if word in director:
+                director_boost[i] = 0.4
+            if word in cast:
+                cast_boost[i] = 0.2
+
+    combined = combined + director_boost + cast_boost
+
     history_set = set(history_ids)
     scored = [
         (float(combined[i]), i)
@@ -212,14 +230,11 @@ def _movie_card(row) -> str:
         f'"{_safe(row["title"])}" ({int(row["year"]) if pd.notna(row.get("year")) else "?"})',
         f'genres: {_safe(row["genres"])}',
         f'director: {_safe(row["director"])}',
-        f'cast: {_safe(row["top_cast"], 80)}',
-        f'rating: {_safe(row["us_rating"])} | runtime: {int(row["runtime_min"]) if pd.notna(row.get("runtime_min")) else "?"}min',
-        f'score: {float(row["vote_average"]):.1f}/10 ({int(row["vote_count"])} votes)',
+        f'cast: {_safe(row["top_cast"], 60)}',
     ]
     if pd.notna(row.get("tagline")) and row["tagline"]:
         parts.append(f'tagline: "{_safe(row["tagline"])}"')
-    parts.append(f'keywords: {_safe(row["keywords"], 100)}')
-    parts.append(f'overview: {_safe(row["overview"], 220)}')
+    parts.append(f'overview: {_safe(row["overview"], 150)}')
     return "\n    ".join(parts)
 
 # ---------------------------------------------------------------------------
@@ -233,7 +248,7 @@ def _get_client() -> ollama.Client:
     return ollama.Client(
         host="https://ollama.com",
         headers={"Authorization": f"Bearer {os.environ['OLLAMA_API_KEY']}"},
-        timeout=httpx.Timeout(15.0),
+        timeout=httpx.Timeout(19.0),
     )
 
 def _call_llm(prompt: str, client: ollama.Client, max_retries: int = 1) -> str:
@@ -259,38 +274,44 @@ def _call_llm(prompt: str, client: ollama.Client, max_retries: int = 1) -> str:
 
 # Single combined prompt — one LLM call does both selection and description
 COMBINED_PROMPT = """\
-You are a movie recommendation expert and film critic.
+You recommend movies like a knowledgeable friend — warm and specific, not a critic, not a salesperson.
 
-A user wants to watch a movie tonight.
-
-User preferences:
+A user wants to watch something tonight:
 "{preferences}"
 
-Movies they have already seen (DO NOT recommend these):
+Already seen (do not recommend):
 {history_text}
 
 Candidates:
 {movie_list}
 
-Your task:
-1. Pick the single best matching movie for this user from the candidates above.
-2. Write a description that will make them desperate to watch it tonight.
+Write a 2-3 sentence recommendation. The goal is to make them genuinely excited, not to sell them something.
 
-Description rules:
-- Max 490 characters
-- Open with a HOOK — not "This film" or "In this movie"
-- Mirror the user's own language and emotional register
-- Mention 1-2 specific details (actor, scene, directorial choice)
+RULES:
+- Max 460 characters. Always end on a complete sentence.
+- Sentence 1: lead with the feeling or the hook — what makes this movie special for THIS person.
+- Sentence 2: one specific, concrete detail — a scene, a performance, a twist — that brings it to life.
+- Sentence 3: a short, natural closer that ties back to what they said they want. Warm but not pushy.
+- Write like a person, not a review. Avoid: "masterpiece", "stunning", "visceral", "cerebral", "you will love", "perfect for you", "put it on".
 - Tone: {tone_instruction}
 
-Respond ONLY with JSON — no markdown:
+Respond ONLY with JSON:
 {{
   "tmdb_id": <integer>,
-  "description": "<your compelling ≤490 char description>"
+  "description": "<your 2-3 sentence ≤460 char recommendation>"
 }}
 """
 
+# In-memory cache — avoids repeat LLM calls for identical inputs within a session
+_response_cache: dict = {}
+
 def get_recommendation(preferences: str, history: list[str], history_ids: list[int] = []) -> dict:
+    # Cache lookup — same preferences + history returns instantly
+    cache_key = (preferences.strip().lower(), tuple(sorted(history_ids)))
+    if cache_key in _response_cache:
+        print("[cache] hit — returning cached result")
+        return _response_cache[cache_key]
+
     t_start = time.perf_counter()
     client = _get_client()
 
@@ -325,7 +346,9 @@ def get_recommendation(preferences: str, history: list[str], history_ids: list[i
 
     elapsed = time.perf_counter() - t_start
     print(f"[timing] total: {elapsed:.1f}s")
-    return {"tmdb_id": tmdb_id, "description": description}
+    result = {"tmdb_id": tmdb_id, "description": description}
+    _response_cache[cache_key] = result
+    return result
 
 # ---------------------------------------------------------------------------
 # CLI
