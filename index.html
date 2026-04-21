@@ -440,6 +440,32 @@
     letter-spacing: 0.15em;
   }
 
+
+  .result-body {
+    display: grid;
+    grid-template-columns: 180px 1fr;
+    gap: 2rem;
+    align-items: start;
+  }
+
+  .result-poster {
+    width: 180px;
+    aspect-ratio: 2/3;
+    object-fit: cover;
+    display: block;
+    border: 1px solid rgba(201,168,76,0.15);
+    opacity: 0;
+    transition: opacity 0.4s ease 0.3s;
+  }
+
+  .result-poster.loaded { opacity: 1; }
+  .result-poster.hidden { display: none; }
+
+  @media (max-width: 600px) {
+    .result-body { grid-template-columns: 1fr; }
+    .result-poster { width: 120px; }
+  }
+
   /* Error */
   .error-msg {
     color: #e07070;
@@ -547,10 +573,15 @@
 <section class="result-section" id="result-section">
   <div class="result-card" id="result-card">
     <div class="result-label">Tonight's recommendation</div>
-    <h2 class="result-title" id="result-title"></h2>
-    <p class="result-meta" id="result-meta"></p>
-    <p class="result-desc" id="result-desc"></p>
-    <p class="result-id" id="result-id"></p>
+    <div class="result-body">
+      <img class="result-poster" id="result-poster" src="" alt="" />
+      <div class="result-content">
+        <h2 class="result-title" id="result-title"></h2>
+        <p class="result-meta" id="result-meta"></p>
+        <p class="result-desc" id="result-desc"></p>
+        <p class="result-id" id="result-id"></p>
+      </div>
+    </div>
   </div>
 </section>
 
@@ -640,10 +671,21 @@
 
       const data = await resp.json();
 
-      document.getElementById('result-title').textContent = 'Film #' + data.tmdb_id;
-      document.getElementById('result-meta').textContent = 'TMDB ID ' + data.tmdb_id + ' · Selected for you';
+      document.getElementById('result-title').textContent = data.title || ('Film #' + data.tmdb_id);
+      document.getElementById('result-meta').textContent = (data.year ? data.year + ' · ' : '') + (data.genres || '') + ' · TMDB ' + data.tmdb_id;
       document.getElementById('result-desc').textContent = data.description;
       document.getElementById('result-id').textContent = 'tmdb_id: ' + data.tmdb_id;
+
+      const poster = document.getElementById('result-poster');
+      if (data.poster) {
+        poster.classList.remove('hidden');
+        poster.src = data.poster;
+        poster.alt = data.title + ' poster';
+        poster.onload = () => poster.classList.add('loaded');
+        poster.onerror = () => poster.classList.add('hidden');
+      } else {
+        poster.classList.add('hidden');
+      }
 
       // Re-animate card
       const card = document.getElementById('result-card');
