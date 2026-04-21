@@ -336,9 +336,14 @@ def get_recommendation(preferences: str, history: list[str], history_ids: list[i
         tone_instruction=tone_instruction,
     ), client)
 
-    data = json.loads(raw)
-    tmdb_id = int(data["tmdb_id"])
-    description = data["description"][:500]
+    try:
+        data = json.loads(raw)
+        tmdb_id = int(data["tmdb_id"])
+        description = data["description"][:500]
+    except (json.JSONDecodeError, KeyError, ValueError) as e:
+        print(f"[warn] LLM response parse error ({e}) — using top candidate")
+        tmdb_id = int(candidates.iloc[0]["tmdb_id"])
+        description = f"A great pick based on your preferences."
 
     if tmdb_id not in valid_ids:
         print(f"[warn] id {tmdb_id} not in candidates — using top candidate")
