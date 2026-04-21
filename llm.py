@@ -362,47 +362,78 @@ def _call_llm(prompt: str, client: ollama.Client, max_retries: int = 2) -> str:
                 raise
 
 # ---------------------------------------------------------------------------
-# Stage 1 — pick the best movie
+# Stage 1 — pick the best movie (selection only)
 # ---------------------------------------------------------------------------
 
-# Single combined prompt — one LLM call does both selection and description
-COMBINED_PROMPT = """\
+PICK_PROMPT = """\
+A user wants to watch a movie tonight:
+"{preferences}"
+
+Already seen (do not recommend these):
+{history_text}
+
+Candidates:
+{movie_list}
+
+Pick the single best match from the list above. Respond ONLY with JSON:
+{{"tmdb_id": <integer>}}
+"""
+
+# ---------------------------------------------------------------------------
+# Stage 2 — write description for the chosen movie only
+# ---------------------------------------------------------------------------
+
+DESCRIBE_PROMPT = """\
 You recommend movies like a knowledgeable friend — casual and genuine, not a critic or a salesperson.
 
 A user wants to watch something tonight:
 "{preferences}"
 
-Already seen (do not recommend):
-{history_text}
+You are recommending this movie:
+{movie_card}
 
-Candidates (use ONLY the details shown here — do not invent plot points, character names, or scenes):
-{movie_list}
-
-Pick ONE movie from the candidates list and write a 2-3 sentence recommendation for it.
+Write a 2-3 sentence recommendation based only on the movie card above.
 
 RULES:
-- The description MUST be about the movie you put in tmdb_id. Never mention or describe a different movie.
-- Use only the title shown in the candidate's movie card — do not reference other films by name.
 - Max 460 characters. Always end on a complete sentence.
-- Sentence 1: connect the movie's mood or genre to what the user asked for. Keep it grounded.
-- Sentence 2: describe the atmosphere, tone, or emotional quality of the film — NOT a specific scene, twist, or character name. No spoilers.
+- Sentence 1: connect this movie's mood or genre to what the user asked for.
+- Sentence 2: describe the atmosphere, tone, or emotional quality — NOT a specific scene, twist, or character name. No spoilers.
 - Sentence 3: a short, natural closer that ties back to what they said they want. Warm but not pushy.
-- Only use details visible in the movie card above. Never invent plot events or character details.
+- Only use details from the movie card above. Never invent plot events, character names, or reference other films.
 - Write like a person texting a friend. Avoid: "masterpiece", "stunning", "visceral", "cerebral", "you will love", "perfect for you", "put it on".
 - Tone: {tone_instruction}
 
 Respond ONLY with JSON:
-{{
-  "tmdb_id": <integer>,
-  "description": "<your 2-3 sentence ≤460 char recommendation>"
-}}
+{{"description": "<your 2-3 sentence ≤460 char recommendation>"}}
 """
+
+# ---------------------------------------------------------------------------
+# JSON parse helper
+# ---------------------------------------------------------------------------
+
+def _parse_json(raw: str) -> dict | None:
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        match = re.search(r'\{.*\}', raw, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group())
+            except json.JSONDecodeError:
+                pass
+    return None
+
+# ---------------------------------------------------------------------------
+# Main recommendation entry point
+# ---------------------------------------------------------------------------
 
 # In-memory cache — avoids repeat LLM calls for identical inputs within a session
 _response_cache: dict = {}
 
 def get_recommendation(preferences: str, history: list[str], history_ids: list[int] = []) -> dict:
-    # Cache lookup — same preferences + history returns instantly
     cache_key = (preferences.strip().lower(), tuple(sorted(history_ids)))
     if cache_key in _response_cache:
         print("[cache] hit — returning cached result")
@@ -417,69 +448,46 @@ def get_recommendation(preferences: str, history: list[str], history_ids: list[i
     tone_instruction, _ = MOOD_MAP.get(mood, MOOD_MAP["thoughtful"])
 
     history_text = (
-        ", ".join(f'"{n}" (id={i})' for n, i in zip(history, history_ids))
-        if history else "none"
+        ", ".join(f'"{n}"' for n in history) if history else "none"
     )
     movie_list = "\n\n".join(
         f"  [{idx+1}]\n    {_movie_card(row)}"
         for idx, (_, row) in enumerate(candidates.iterrows())
     )
 
-    raw = _call_llm(COMBINED_PROMPT.format(
+    # Stage 1 — pick tmdb_id
+    raw1 = _call_llm(PICK_PROMPT.format(
         preferences=preferences,
         history_text=history_text,
         movie_list=movie_list,
+    ), client)
+
+    data1 = _parse_json(raw1)
+    if not data1 or "tmdb_id" not in data1:
+        print("[warn] stage 1 parse failed — using top candidate")
+        tmdb_id = int(candidates.iloc[0]["tmdb_id"])
+    else:
+        tmdb_id = int(data1["tmdb_id"])
+        if tmdb_id not in valid_ids:
+            print(f"[warn] stage 1 id {tmdb_id} not in candidates — using top candidate")
+            tmdb_id = int(candidates.iloc[0]["tmdb_id"])
+
+    print(f"[stage1] picked tmdb_id={tmdb_id} in {time.perf_counter()-t_start:.1f}s")
+
+    # Stage 2 — write description for the chosen movie only
+    selected_row = candidates[candidates["tmdb_id"] == tmdb_id].iloc[0]
+    raw2 = _call_llm(DESCRIBE_PROMPT.format(
+        preferences=preferences,
+        movie_card=_movie_card(selected_row),
         tone_instruction=tone_instruction,
     ), client)
 
-    # Guard against empty or malformed LLM response
-    raw = (raw or "").strip()
-    if not raw:
-        print("[warn] empty LLM response — using top candidate with fallback description")
-        tmdb_id = int(candidates.iloc[0]["tmdb_id"])
-        row = candidates.iloc[0]
-        description = f"{_safe(row['title'])}: {_safe(row['overview'], 400)}"[:500]
-        return {"tmdb_id": tmdb_id, "description": description}
-
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        # Try extracting JSON from response if wrapped in text
-        import re as _re
-        match = _re.search(r'\{.*\}', raw, _re.DOTALL)
-        if match:
-            data = json.loads(match.group())
-        else:
-            print(f"[warn] could not parse LLM response: {raw[:100]}")
-            tmdb_id = int(candidates.iloc[0]["tmdb_id"])
-            row = candidates.iloc[0]
-            description = f"{_safe(row['title'])}: {_safe(row['overview'], 400)}"[:500]
-            return {"tmdb_id": tmdb_id, "description": description}
-
-    tmdb_id = int(data["tmdb_id"])
-    description = data["description"][:500]
-
-    if tmdb_id not in valid_ids:
-        print(f"[warn] id {tmdb_id} not in candidates — using top candidate")
-        tmdb_id = int(candidates.iloc[0]["tmdb_id"])
-
-    # Validate description is actually about the selected movie.
-    # Score overlap between description tokens and the movie's overview tokens.
-    selected_row = candidates[candidates["tmdb_id"] == tmdb_id].iloc[0]
-    overview_tokens = set(_tokenize(_safe(selected_row.get("overview", ""))))
-    desc_tokens = set(_tokenize(description))
-    overlap = len(desc_tokens & overview_tokens)
-    # Also flag if another candidate's title words dominate the description
-    other_titles = [_safe(r["title"]) for _, r in candidates.iterrows() if int(r["tmdb_id"]) != tmdb_id]
-    hallucinated = any(
-        sum(1 for w in _title_tokens(t) if w in description.lower()) >= 2
-        for t in other_titles
-    )
-    if hallucinated or (overlap < 2 and len(overview_tokens) > 5):
-        print(f"[warn] description mismatch for '{_safe(selected_row['title'])}' — using overview fallback")
-        genres = _safe(selected_row.get("genres", ""))
-        overview = _safe(selected_row.get("overview", ""), 300)
-        description = f"{overview} ({genres})".strip()[:460]
+    data2 = _parse_json(raw2)
+    if not data2 or "description" not in data2:
+        print("[warn] stage 2 parse failed — using overview fallback")
+        description = _safe(selected_row.get("overview", ""), 460)
+    else:
+        description = data2["description"][:460]
 
     elapsed = time.perf_counter() - t_start
     print(f"[timing] total: {elapsed:.1f}s")
