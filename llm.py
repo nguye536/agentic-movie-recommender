@@ -378,9 +378,11 @@ Already seen (do not recommend):
 Candidates (use ONLY the details shown here — do not invent plot points, character names, or scenes):
 {movie_list}
 
-Write a 2-3 sentence recommendation. Goal: make them feel like this is exactly the right pick tonight.
+Pick ONE movie from the candidates list and write a 2-3 sentence recommendation for it.
 
 RULES:
+- The description MUST be about the movie you put in tmdb_id. Never mention or describe a different movie.
+- Use only the title shown in the candidate's movie card — do not reference other films by name.
 - Max 460 characters. Always end on a complete sentence.
 - Sentence 1: connect the movie's mood or genre to what the user asked for. Keep it grounded.
 - Sentence 2: describe the atmosphere, tone, or emotional quality of the film — NOT a specific scene, twist, or character name. No spoilers.
@@ -460,6 +462,14 @@ def get_recommendation(preferences: str, history: list[str], history_ids: list[i
     if tmdb_id not in valid_ids:
         print(f"[warn] id {tmdb_id} not in candidates — using top candidate")
         tmdb_id = int(candidates.iloc[0]["tmdb_id"])
+
+    # Warn if description appears to be about a different movie
+    selected_title = _safe(candidates[candidates["tmdb_id"] == tmdb_id].iloc[0]["title"]).lower()
+    other_titles = [_safe(r["title"]).lower() for _, r in candidates.iterrows() if int(r["tmdb_id"]) != tmdb_id]
+    if not any(word in description.lower() for word in selected_title.split() if len(word) > 3):
+        for other in other_titles:
+            if any(word in description.lower() for word in other.split() if len(word) > 4):
+                print(f"[warn] description mentions '{other}' instead of '{selected_title}' — mismatch likely")
 
     elapsed = time.perf_counter() - t_start
     print(f"[timing] total: {elapsed:.1f}s")
