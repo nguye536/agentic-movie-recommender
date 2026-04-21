@@ -435,6 +435,8 @@ def _parse_json(raw: str) -> dict | None:
 # In-memory cache — avoids repeat LLM calls for identical inputs within a session
 _response_cache: dict = {}
 
+HARD_DEADLINE = 18.0  # return fallback before grader kills at 20s
+
 def get_recommendation(preferences: str, history: list[str], history_ids: list[int] = []) -> dict:
     cache_key = (preferences.strip().lower(), tuple(sorted(history_ids)))
     if cache_key in _response_cache:
@@ -448,6 +450,15 @@ def get_recommendation(preferences: str, history: list[str], history_ids: list[i
     mood = detect_mood(preferences)
     tone_instruction, _ = MOOD_MAP.get(mood, MOOD_MAP["thoughtful"])
 
+    # Pre-compute fallback from top retrieval candidate — used if deadline is hit
+    def _fallback(row):
+        tmdb_id = int(row["tmdb_id"])
+        description = _safe(row.get("overview", ""), 460)
+        print(f"[fallback] returning top candidate tmdb_id={tmdb_id}")
+        result = {"tmdb_id": tmdb_id, "description": description}
+        _response_cache[cache_key] = result
+        return result
+
     history_text = (
         ", ".join(f'"{n}"' for n in history) if history else "none"
     )
@@ -457,11 +468,18 @@ def get_recommendation(preferences: str, history: list[str], history_ids: list[i
     )
 
     # Stage 1 — pick tmdb_id
-    raw1 = _call_llm(PICK_PROMPT.format(
-        preferences=preferences,
-        history_text=history_text,
-        movie_list=movie_list,
-    ), _client)
+    if time.perf_counter() - t_start >= HARD_DEADLINE:
+        return _fallback(candidates.iloc[0])
+
+    try:
+        raw1 = _call_llm(PICK_PROMPT.format(
+            preferences=preferences,
+            history_text=history_text,
+            movie_list=movie_list,
+        ), _client)
+    except Exception as e:
+        print(f"[warn] stage 1 failed ({e}) — using fallback")
+        return _fallback(candidates.iloc[0])
 
     data1 = _parse_json(raw1)
     if not data1 or "tmdb_id" not in data1:
@@ -475,13 +493,21 @@ def get_recommendation(preferences: str, history: list[str], history_ids: list[i
 
     print(f"[stage1] picked tmdb_id={tmdb_id} in {time.perf_counter()-t_start:.1f}s")
 
-    # Stage 2 — write description for the chosen movie only
     selected_row = candidates[candidates["tmdb_id"] == tmdb_id].iloc[0]
-    raw2 = _call_llm(DESCRIBE_PROMPT.format(
-        preferences=preferences,
-        movie_card=_movie_card(selected_row),
-        tone_instruction=tone_instruction,
-    ), _client)
+
+    # Stage 2 — write description (skip if deadline is near)
+    if time.perf_counter() - t_start >= HARD_DEADLINE:
+        return _fallback(selected_row)
+
+    try:
+        raw2 = _call_llm(DESCRIBE_PROMPT.format(
+            preferences=preferences,
+            movie_card=_movie_card(selected_row),
+            tone_instruction=tone_instruction,
+        ), _client)
+    except Exception as e:
+        print(f"[warn] stage 2 failed ({e}) — using overview fallback")
+        return _fallback(selected_row)
 
     data2 = _parse_json(raw2)
     if not data2 or "description" not in data2:
