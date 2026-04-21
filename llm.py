@@ -251,7 +251,7 @@ def _get_client() -> ollama.Client:
         timeout=httpx.Timeout(19.0),
     )
 
-def _call_llm(prompt: str, client: ollama.Client, max_retries: int = 1) -> str:
+def _call_llm(prompt: str, client: ollama.Client, max_retries: int = 2) -> str:
     for attempt in range(max_retries):
         try:
             response = client.chat(
@@ -259,11 +259,15 @@ def _call_llm(prompt: str, client: ollama.Client, max_retries: int = 1) -> str:
                 messages=[{"role": "user", "content": prompt}],
                 format="json",
             )
-            return response.message.content
+            content = response.message.content
+            # Retry if empty response
+            if not content or not content.strip():
+                raise ValueError("empty response from LLM")
+            return content
         except Exception as e:
             if attempt < max_retries - 1:
-                wait = 2 ** attempt + random.uniform(0, 1)
-                print(f"[LLM] retry {attempt+1}/{max_retries} after {wait:.1f}s — {type(e).__name__}")
+                wait = 1.0 + random.uniform(0, 0.5)
+                print(f"[LLM] retry {attempt+1}/{max_retries} after {wait:.1f}s — {e}")
                 time.sleep(wait)
             else:
                 raise
@@ -336,14 +340,32 @@ def get_recommendation(preferences: str, history: list[str], history_ids: list[i
         tone_instruction=tone_instruction,
     ), client)
 
+    # Guard against empty or malformed LLM response
+    raw = (raw or "").strip()
+    if not raw:
+        print("[warn] empty LLM response — using top candidate with fallback description")
+        tmdb_id = int(candidates.iloc[0]["tmdb_id"])
+        row = candidates.iloc[0]
+        description = f"{_safe(row['title'])}: {_safe(row['overview'], 400)}"[:500]
+        return {"tmdb_id": tmdb_id, "description": description}
+
     try:
         data = json.loads(raw)
-        tmdb_id = int(data["tmdb_id"])
-        description = data["description"][:500]
-    except (json.JSONDecodeError, KeyError, ValueError) as e:
-        print(f"[warn] LLM response parse error ({e}) — using top candidate")
-        tmdb_id = int(candidates.iloc[0]["tmdb_id"])
-        description = f"A great pick based on your preferences."
+    except json.JSONDecodeError:
+        # Try extracting JSON from response if wrapped in text
+        import re as _re
+        match = _re.search(r'\{.*\}', raw, _re.DOTALL)
+        if match:
+            data = json.loads(match.group())
+        else:
+            print(f"[warn] could not parse LLM response: {raw[:100]}")
+            tmdb_id = int(candidates.iloc[0]["tmdb_id"])
+            row = candidates.iloc[0]
+            description = f"{_safe(row['title'])}: {_safe(row['overview'], 400)}"[:500]
+            return {"tmdb_id": tmdb_id, "description": description}
+
+    tmdb_id = int(data["tmdb_id"])
+    description = data["description"][:500]
 
     if tmdb_id not in valid_ids:
         print(f"[warn] id {tmdb_id} not in candidates — using top candidate")
