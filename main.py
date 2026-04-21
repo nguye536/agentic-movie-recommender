@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
-from llm import get_recommendation, DF
+from llm import get_recommendation, fuzzy_search_titles, DF
 
 app = FastAPI()
 HTML_PATH = Path(__file__).parent / "index.html"
@@ -31,6 +31,11 @@ def index():
     if HTML_PATH.exists():
         return HTML_PATH.read_text()
     return HTMLResponse("<h1>CineMatch</h1>")
+
+
+@app.get("/search")
+def search_movies(q: str, limit: int = 5):
+    return {"results": fuzzy_search_titles(q, limit)}
 
 
 @app.post("/recommend")

@@ -173,32 +173,95 @@ def _quality_scores() -> np.ndarray:
 _qual = _quality_scores()
 
 # ---------------------------------------------------------------------------
+# Fuzzy title matching — resolves partial/approximate movie names to tmdb_ids
+# ---------------------------------------------------------------------------
+
+_TITLE_STOPWORDS = {"the", "a", "an", "and", "or", "of", "in", "on", "at", "to"}
+
+def _title_tokens(s: str) -> set[str]:
+    return set(re.sub(r"[^a-z0-9\s]", " ", s.lower()).split()) - _TITLE_STOPWORDS
+
+def fuzzy_match_title(name: str) -> int:
+    """Return tmdb_id of best fuzzy match for a partial/misspelled title, or 0."""
+    q = _title_tokens(name)
+    if not q:
+        return 0
+    best_id, best_score = 0, 0.0
+    for _, row in DF.iterrows():
+        t = _title_tokens(_safe(row.get("title", "")))
+        if not t:
+            continue
+        overlap = len(q & t)
+        score = overlap / len(q)  # fraction of query words found in title
+        if score > best_score:
+            best_score, best_id = score, int(row["tmdb_id"])
+    return best_id if best_score >= 0.6 else 0
+
+def fuzzy_search_titles(query: str, limit: int = 5) -> list[dict]:
+    """Return top matching movies for a partial title query."""
+    q = _title_tokens(query)
+    if not q:
+        return []
+    scored = []
+    for _, row in DF.iterrows():
+        t = _title_tokens(_safe(row.get("title", "")))
+        if not t:
+            continue
+        overlap = len(q & t)
+        if overlap == 0:
+            continue
+        score = overlap / len(q)
+        scored.append((score, int(row["tmdb_id"]), _safe(row["title"]), int(row["year"]) if pd.notna(row.get("year")) else 0))
+    scored.sort(reverse=True)
+    return [{"tmdb_id": tid, "title": title, "year": year} for _, tid, title, year in scored[:limit]]
+
+# ---------------------------------------------------------------------------
 # Candidate retrieval
 # ---------------------------------------------------------------------------
 
-def retrieve_candidates(preferences: str, history_ids: list[int], k: int = TOP_K_CANDIDATES) -> pd.DataFrame:
+_GENRE_KEYWORDS = {
+    "action", "comedy", "horror", "drama", "thriller", "romance", "animation",
+    "family", "documentary", "fantasy", "mystery", "crime", "adventure",
+    "sci-fi", "science fiction", "western", "musical", "biography",
+}
+
+def retrieve_candidates(preferences: str, history_ids: list[int], history_names: list[str] = [], k: int = TOP_K_CANDIDATES) -> pd.DataFrame:
     sem = _semantic_scores(preferences)
     s_min, s_max = sem.min(), sem.max()
     sem_norm = (sem - s_min) / (s_max - s_min + 1e-9)
     combined = 0.70 * sem_norm + 0.30 * _qual
 
-    # Director/actor boost: if preferences mention a name that matches director or cast, boost those films
     prefs_lower = preferences.lower()
+
+    # Director/actor boost
     director_boost = np.zeros(len(DF), dtype=np.float32)
     cast_boost = np.zeros(len(DF), dtype=np.float32)
+    # Genre boost: when user says "action movie", prioritise actual action films
+    genre_boost = np.zeros(len(DF), dtype=np.float32)
     for i, (_, row) in enumerate(DF.iterrows()):
         director = _safe(row.get("director", "")).lower()
         cast = _safe(row.get("top_cast", "")).lower()
-        # Check if any word 4+ chars from preferences matches director or cast
+        genres = _safe(row.get("genres", "")).lower()
         for word in re.findall(r"[a-z]{4,}", prefs_lower):
             if word in director:
                 director_boost[i] = 0.4
             if word in cast:
                 cast_boost[i] = 0.2
+        for gkw in _GENRE_KEYWORDS:
+            if gkw in prefs_lower and gkw in genres:
+                genre_boost[i] = 0.25
+                break
 
-    combined = combined + director_boost + cast_boost
+    combined = combined + director_boost + cast_boost + genre_boost
 
+    # Build exclusion set: explicit ids + fuzzy-matched names for unresolved (id=0) entries
     history_set = set(history_ids)
+    for name, hid in zip(history_names, history_ids):
+        if hid == 0 and name:
+            resolved = fuzzy_match_title(name)
+            if resolved:
+                history_set.add(resolved)
+
     scored = [
         (float(combined[i]), i)
         for i, (_, row) in enumerate(DF.iterrows())
@@ -278,7 +341,7 @@ def _call_llm(prompt: str, client: ollama.Client, max_retries: int = 2) -> str:
 
 # Single combined prompt — one LLM call does both selection and description
 COMBINED_PROMPT = """\
-You recommend movies like a knowledgeable friend — warm and specific, not a critic, not a salesperson.
+You recommend movies like a knowledgeable friend — casual and genuine, not a critic or a salesperson.
 
 A user wants to watch something tonight:
 "{preferences}"
@@ -286,17 +349,18 @@ A user wants to watch something tonight:
 Already seen (do not recommend):
 {history_text}
 
-Candidates:
+Candidates (use ONLY the details shown here — do not invent plot points, character names, or scenes):
 {movie_list}
 
-Write a 2-3 sentence recommendation. The goal is to make them genuinely excited, not to sell them something.
+Write a 2-3 sentence recommendation. Goal: make them feel like this is exactly the right pick tonight.
 
 RULES:
 - Max 460 characters. Always end on a complete sentence.
-- Sentence 1: lead with the feeling or the hook — what makes this movie special for THIS person.
-- Sentence 2: one specific, concrete detail — a scene, a performance, a twist — that brings it to life.
+- Sentence 1: connect the movie's mood or genre to what the user asked for. Keep it grounded.
+- Sentence 2: describe the atmosphere, tone, or emotional quality of the film — NOT a specific scene, twist, or character name. No spoilers.
 - Sentence 3: a short, natural closer that ties back to what they said they want. Warm but not pushy.
-- Write like a person, not a review. Avoid: "masterpiece", "stunning", "visceral", "cerebral", "you will love", "perfect for you", "put it on".
+- Only use details visible in the movie card above. Never invent plot events or character details.
+- Write like a person texting a friend. Avoid: "masterpiece", "stunning", "visceral", "cerebral", "you will love", "perfect for you", "put it on".
 - Tone: {tone_instruction}
 
 Respond ONLY with JSON:
@@ -319,7 +383,7 @@ def get_recommendation(preferences: str, history: list[str], history_ids: list[i
     t_start = time.perf_counter()
     client = _get_client()
 
-    candidates = retrieve_candidates(preferences, history_ids)
+    candidates = retrieve_candidates(preferences, history_ids, history)
     valid_ids = set(candidates["tmdb_id"].tolist())
     mood = detect_mood(preferences)
     tone_instruction, _ = MOOD_MAP.get(mood, MOOD_MAP["thoughtful"])

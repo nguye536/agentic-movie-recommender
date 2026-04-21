@@ -602,13 +602,24 @@
 
   // History management
   const history = [];
-  function addHistory() {
+  async function addHistory() {
     const input = document.getElementById('history-input');
     const val = input.value.trim();
     if (!val || history.find(h => h.name.toLowerCase() === val.toLowerCase())) return;
-    history.push({ name: val, tmdb_id: 0 });
+    const item = { name: val, tmdb_id: 0 };
+    history.push(item);
     renderTags();
     input.value = '';
+    // Silently resolve partial/fuzzy title to real tmdb_id + canonical name
+    try {
+      const resp = await fetch(`${API_BASE}/search?q=${encodeURIComponent(val)}&limit=1`);
+      const data = await resp.json();
+      if (data.results && data.results.length > 0) {
+        item.tmdb_id = data.results[0].tmdb_id;
+        item.name = data.results[0].title;
+        renderTags();
+      }
+    } catch {}
   }
 
   document.getElementById('history-input').addEventListener('keydown', e => {
