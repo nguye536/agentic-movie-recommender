@@ -100,7 +100,7 @@ def _get_client() -> ollama.Client:
     )
 
 # ---------------------------------------------------------------------------
-# Semantic retrieval — pre-computed embeddings + one query embed call
+# Semantic retrieval — pre-computed embeddings + TF-IDF query embedding
 # ---------------------------------------------------------------------------
 
 _doc_embeddings: np.ndarray | None = None
@@ -111,17 +111,39 @@ if os.path.exists(EMBED_CACHE_PATH):
 else:
     print("[embed] movie_embeddings.npy not found — run generate_embeddings.py locally and commit the file")
 
-def _embed_query(query: str, client: ollama.Client) -> np.ndarray:
-    resp = client.embed(model=EMBED_MODEL, input=[query])
-    vec = np.array(resp["embeddings"][0], dtype=np.float32)
-    vec /= (np.linalg.norm(vec) + 1e-9)
-    return vec
+def _query_embedding_tfidf(query: str) -> np.ndarray:
+    """Convert query to a sparse TF-IDF vector in the same space as doc embeddings."""
+    q_tokens = _tokenize(query)
+    if not q_tokens:
+        return np.zeros(_doc_embeddings.shape[1], dtype=np.float32)
+    
+    # Build TF-IDF vector for query
+    q_vec = np.zeros(len(_idf), dtype=np.float32)
+    token_to_idx = {t: i for i, t in enumerate(sorted(_idf.keys()))}
+    
+    for token in q_tokens:
+        if token in token_to_idx:
+            q_vec[token_to_idx[token]] = _idf.get(token, 0.0)
+    
+    # Normalize to unit length
+    norm = np.linalg.norm(q_vec)
+    if norm > 0:
+        q_vec /= norm
+    
+    return q_vec
 
-def _semantic_scores(query: str, client: ollama.Client) -> np.ndarray:
+def _semantic_scores(query: str, client: ollama.Client = None) -> np.ndarray:
+    """Score movies using pre-computed semantic embeddings."""
     if _doc_embeddings is not None:
-        q = _embed_query(query, client)
-        return _doc_embeddings @ q          # cosine similarity (both normalised)
-    return _tfidf_scores(query)             # fallback
+        # Use TF-IDF to embed the query (no API call needed)
+        q = _query_embedding_tfidf(query)
+        # Pad or trim q to match embedding dimension if needed
+        if len(q) < _doc_embeddings.shape[1]:
+            q = np.pad(q, (0, _doc_embeddings.shape[1] - len(q)))
+        elif len(q) > _doc_embeddings.shape[1]:
+            q = q[:_doc_embeddings.shape[1]]
+        return _doc_embeddings @ q  # dot product = cosine similarity (both normalised)
+    return _tfidf_scores(query)  # fallback to full TF-IDF
 
 # ---------------------------------------------------------------------------
 # TF-IDF fallback (pure Python, no packages)
@@ -178,8 +200,8 @@ _qual = _quality_scores()
 # Candidate retrieval
 # ---------------------------------------------------------------------------
 
-def retrieve_candidates(preferences: str, history_ids: list[int], client: ollama.Client, k: int = TOP_K_CANDIDATES) -> pd.DataFrame:
-    sem = _semantic_scores(preferences, client)
+def retrieve_candidates(preferences: str, history_ids: list[int], k: int = TOP_K_CANDIDATES) -> pd.DataFrame:
+    sem = _semantic_scores(preferences)
     s_min, s_max = sem.min(), sem.max()
     sem_norm = (sem - s_min) / (s_max - s_min + 1e-9)
     combined = 0.70 * sem_norm + 0.30 * _qual
@@ -344,7 +366,7 @@ def stage2_describe(preferences, tmdb_id, reasoning, mood, candidates, client):
 
 def get_recommendation(preferences: str, history: list[str], history_ids: list[int] = []) -> dict:
     client = _get_client()
-    candidates = retrieve_candidates(preferences, history_ids, client)
+    candidates = retrieve_candidates(preferences, history_ids)
     valid_ids = set(candidates["tmdb_id"].tolist())
     mood = detect_mood(preferences)
     tmdb_id, reasoning = stage1_select(preferences, history, history_ids, candidates, client)
