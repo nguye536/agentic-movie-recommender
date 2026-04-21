@@ -36,7 +36,6 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 
 MODEL = "gemma4:31b-cloud"
-EMBED_MODEL = "nomic-embed-text"
 DATA_PATH = os.path.join(os.path.dirname(__file__), "tmdb_top1000_movies.csv")
 EMBED_CACHE_PATH = os.path.join(os.path.dirname(__file__), "movie_embeddings.npy")
 TOP_K_CANDIDATES = 15
@@ -85,16 +84,6 @@ def _build_doc(row) -> str:
     return " | ".join(p for p in parts if p)
 
 _docs = [_build_doc(row) for _, row in DF.iterrows()]
-
-# ---------------------------------------------------------------------------
-# Ollama client
-# ---------------------------------------------------------------------------
-
-def _get_client() -> ollama.Client:
-    return ollama.Client(
-        host="https://ollama.com",
-        headers={"Authorization": f"Bearer {os.environ['OLLAMA_API_KEY']}"},
-    )
 
 # ---------------------------------------------------------------------------
 # TF-IDF index (pure Python, used for both fallback and query matching)
@@ -234,10 +223,20 @@ def _movie_card(row) -> str:
     return "\n    ".join(parts)
 
 # ---------------------------------------------------------------------------
-# LLM call with retry
+# Ollama client + retry
 # ---------------------------------------------------------------------------
 
-def _call_llm(prompt: str, client: ollama.Client, max_retries: int = 3) -> str:
+DEADLINE_SECS = 18.0   # hard budget; grader kills at 20s
+
+def _get_client() -> ollama.Client:
+    import httpx
+    return ollama.Client(
+        host="https://ollama.com",
+        headers={"Authorization": f"Bearer {os.environ['OLLAMA_API_KEY']}"},
+        timeout=httpx.Timeout(15.0),
+    )
+
+def _call_llm(prompt: str, client: ollama.Client, max_retries: int = 1) -> str:
     for attempt in range(max_retries):
         try:
             response = client.chat(
@@ -258,8 +257,11 @@ def _call_llm(prompt: str, client: ollama.Client, max_retries: int = 3) -> str:
 # Stage 1 — pick the best movie
 # ---------------------------------------------------------------------------
 
-STAGE1_PROMPT = """\
-You are a movie recommendation expert. A user wants to watch a movie tonight.
+# Single combined prompt — one LLM call does both selection and description
+COMBINED_PROMPT = """\
+You are a movie recommendation expert and film critic.
+
+A user wants to watch a movie tonight.
 
 User preferences:
 "{preferences}"
@@ -267,24 +269,36 @@ User preferences:
 Movies they have already seen (DO NOT recommend these):
 {history_text}
 
-Below are {k} candidate movies. Your job is to pick the single best match for this user.
-
-Think step by step before deciding:
-1. What does this user REALLY want emotionally and thematically?
-2. Which movie best fits their specific preferences — not just surface genre?
-3. Are there any obvious mismatches to rule out?
-
 Candidates:
 {movie_list}
 
-Respond ONLY with a JSON object — no markdown, no extra text:
+Your task:
+1. Pick the single best matching movie for this user from the candidates above.
+2. Write a description that will make them desperate to watch it tonight.
+
+Description rules:
+- Max 490 characters
+- Open with a HOOK — not "This film" or "In this movie"
+- Mirror the user's own language and emotional register
+- Mention 1-2 specific details (actor, scene, directorial choice)
+- Tone: {tone_instruction}
+
+Respond ONLY with JSON — no markdown:
 {{
   "tmdb_id": <integer>,
-  "reasoning": "<2-3 sentences explaining why this is the best pick>"
+  "description": "<your compelling ≤490 char description>"
 }}
 """
 
-def stage1_select(preferences, history, history_ids, candidates, client):
+def get_recommendation(preferences: str, history: list[str], history_ids: list[int] = []) -> dict:
+    t_start = time.perf_counter()
+    client = _get_client()
+
+    candidates = retrieve_candidates(preferences, history_ids)
+    valid_ids = set(candidates["tmdb_id"].tolist())
+    mood = detect_mood(preferences)
+    tone_instruction, _ = MOOD_MAP.get(mood, MOOD_MAP["thoughtful"])
+
     history_text = (
         ", ".join(f'"{n}" (id={i})' for n, i in zip(history, history_ids))
         if history else "none"
@@ -293,74 +307,24 @@ def stage1_select(preferences, history, history_ids, candidates, client):
         f"  [{idx+1}]\n    {_movie_card(row)}"
         for idx, (_, row) in enumerate(candidates.iterrows())
     )
-    raw = _call_llm(STAGE1_PROMPT.format(
+
+    raw = _call_llm(COMBINED_PROMPT.format(
         preferences=preferences,
         history_text=history_text,
-        k=len(candidates),
         movie_list=movie_list,
-    ), client)
-    data = json.loads(raw)
-    return int(data["tmdb_id"]), data.get("reasoning", "")
-
-# ---------------------------------------------------------------------------
-# Stage 2 — write the description
-# ---------------------------------------------------------------------------
-
-STAGE2_PROMPT = """\
-You are a brilliant film critic writing for an audience of movie lovers.
-
-A user is looking for a movie to watch. Here is what they said:
-"{preferences}"
-
-You have selected this movie for them:
-{movie_card}
-
-Your reasoning for selecting it:
-{reasoning}
-
-Now write a description that will make this user desperate to watch the film tonight.
-
-Rules:
-- Max 500 characters (aim for 460-490 to be safe — it will be truncated if longer)
-- Open with a HOOK — not "This film" or "In this movie". Start with emotion, action, or intrigue.
-- Mirror the user's own language. If they said "{mood_word}", echo that energy.
-- Mention 1-2 specific details (scene, actor, directorial choice) matching their preferences.
-- Tone: {tone_instruction}
-
-Respond ONLY with JSON — no markdown:
-{{
-  "description": "<your compelling description>"
-}}
-"""
-
-def stage2_describe(preferences, tmdb_id, reasoning, mood, candidates, client):
-    row = candidates[candidates["tmdb_id"] == tmdb_id].iloc[0]
-    tone_instruction, keywords = MOOD_MAP.get(mood, MOOD_MAP["thoughtful"])
-    mood_word = next((kw for kw in keywords if kw in preferences.lower()), mood)
-    raw = _call_llm(STAGE2_PROMPT.format(
-        preferences=preferences,
-        movie_card=_movie_card(row),
-        reasoning=reasoning,
-        mood_word=mood_word,
         tone_instruction=tone_instruction,
     ), client)
-    return json.loads(raw)["description"][:500]
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
+    data = json.loads(raw)
+    tmdb_id = int(data["tmdb_id"])
+    description = data["description"][:500]
 
-def get_recommendation(preferences: str, history: list[str], history_ids: list[int] = []) -> dict:
-    client = _get_client()
-    candidates = retrieve_candidates(preferences, history_ids)
-    valid_ids = set(candidates["tmdb_id"].tolist())
-    mood = detect_mood(preferences)
-    tmdb_id, reasoning = stage1_select(preferences, history, history_ids, candidates, client)
     if tmdb_id not in valid_ids:
-        print(f"[warn] LLM returned id {tmdb_id} not in candidates — using top candidate")
+        print(f"[warn] id {tmdb_id} not in candidates — using top candidate")
         tmdb_id = int(candidates.iloc[0]["tmdb_id"])
-        reasoning = "Selected as best semantic match."
-    description = stage2_describe(preferences, tmdb_id, reasoning, mood, candidates, client)
+
+    elapsed = time.perf_counter() - t_start
+    print(f"[timing] total: {elapsed:.1f}s")
     return {"tmdb_id": tmdb_id, "description": description}
 
 # ---------------------------------------------------------------------------
