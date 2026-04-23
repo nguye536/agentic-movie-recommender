@@ -72,12 +72,13 @@ def run_timing():
             times.append(elapsed)
             ok = elapsed < 20
             sem = _sem_score(p["preferences"], rec["tmdb_id"], p["history_ids"])
-            print(f"→ {elapsed:.1f}s  sem={sem:.2f}  {'✅' if ok else '❌ OVER LIMIT'}")
+            status = "OK" if ok else "OVER LIMIT"
+            print(f"-> {elapsed:.1f}s  sem={sem:.2f}  [{status}]")
             if not ok: failures.append((p["preferences"], elapsed))
         except Exception as e:
             elapsed = time.perf_counter() - t0
             times.append(elapsed)
-            print(f"→ {elapsed:.1f}s ❌ ERROR: {e}")
+            print(f"-> {elapsed:.1f}s  [ERROR: {e}]")
             failures.append((p["preferences"], elapsed))
 
     print(f"\n=== Results ===")
@@ -87,10 +88,10 @@ def run_timing():
     print(f"  Median: {statistics.median(times):.1f}s")
     print(f"  Passed: {len(times)-len(failures)}/{len(times)}")
     if failures:
-        print(f"\n❌ Failed:")
+        print(f"\n[FAIL] Failed:")
         for pref, t in failures: print(f"  {t:.1f}s — \"{pref[:50]}\"")
     else:
-        print(f"\n✅ All prompts under 20s!")
+        print(f"\n[OK] All prompts under 20s!")
 
 # ---------------------------------------------------------------------------
 # Score mode
@@ -122,7 +123,7 @@ def run_score():
             results.append({**p, "recommended": row["title"], "semantic_score": round(sem, 3), "scores": scores})
             for k in totals: totals[k] += scores.get(k, 0)
             n += 1
-            print(f"  → {row['title']} | sem={sem:.2f} | rel={scores.get('relevance')} qual={scores.get('quality')} spec={scores.get('specificity')} overall={scores.get('overall')}")
+            print(f"  -> {row['title']} | sem={sem:.2f} | rel={scores.get('relevance')} qual={scores.get('quality')} spec={scores.get('specificity')} overall={scores.get('overall')}")
             print(f"     {scores.get('reasoning','')}")
         except Exception as e:
             print(f"  [error] {e}")
@@ -166,7 +167,7 @@ def run_ab():
             w = verdict.get("winner","tie")
             wins[w] = wins.get(w,0)+1
             results.append({"prompt":p["preferences"],"a":ma["title"],"b":mb["title"],"winner":w,"reasoning":verdict.get("reasoning","")})
-            print(f"  {ma['title']} vs {mb['title']} → {w}")
+            print(f"  {ma['title']} vs {mb['title']} -> {w}")
         except Exception as e:
             print(f"  [error] {e}")
     print(f"\n=== Results ===\n  Our wins: {wins['A']}  Baseline: {wins['B']}  Ties: {wins.get('tie',0)}")
@@ -191,7 +192,7 @@ def run_quick():
     title = movie.iloc[0]["title"] if not movie.empty else "unknown"
     print(f'Recommended: "{title}" (tmdb_id={result["tmdb_id"]})')
     print(f'Description: {result["description"]}')
-    print(f'Time: {elapsed:.1f}s {"✅" if elapsed < 20 else "❌ OVER LIMIT"}')
+    print(f'Time: {elapsed:.1f}s {"[OK]" if elapsed < 20 else "[FAIL] OVER LIMIT"}')
 
 # ---------------------------------------------------------------------------
 # Entry point

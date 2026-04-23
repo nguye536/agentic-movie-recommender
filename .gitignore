@@ -3,3 +3,12 @@ __pycache__/
 *.pyc
 .venv/
 /.agent-shell/
+.claude/
+
+# test artifacts
+results_*.jsonl
+log_*.txt
+judge_run*.txt
+judge_output.json
+judge_hanna_updated.json
+eval.py
