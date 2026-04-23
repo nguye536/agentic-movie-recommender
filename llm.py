@@ -321,11 +321,13 @@ def _movie_card(row) -> str:
         f'"{_safe(row["title"])}" ({int(row["year"]) if pd.notna(row.get("year")) else "?"})',
         f'genres: {_safe(row["genres"])}',
         f'director: {_safe(row["director"])}',
-        f'cast: {_safe(row["top_cast"], 60)}',
+        f'cast: {_safe(row["top_cast"], 120)}',
     ]
     if pd.notna(row.get("tagline")) and row["tagline"]:
         parts.append(f'tagline: "{_safe(row["tagline"])}"')
-    parts.append(f'overview: {_safe(row["overview"], 150)}')
+    if pd.notna(row.get("keywords")) and row["keywords"]:
+        parts.append(f'keywords: {_safe(row["keywords"], 160)}')
+    parts.append(f'overview: {_safe(row["overview"], 320)}')
     return "\n    ".join(parts)
 
 # ---------------------------------------------------------------------------
@@ -337,12 +339,16 @@ def _make_client() -> ollama.Client:
     return ollama.Client(
         host="https://ollama.com",
         headers={"Authorization": f"Bearer {os.environ['OLLAMA_API_KEY']}"},
-        timeout=httpx.Timeout(19.0),
+        timeout=httpx.Timeout(8.0),
     )
 
 _client: ollama.Client = _make_client()
 
-def _call_llm(prompt: str, client: ollama.Client, max_retries: int = 2) -> str:
+# Skip a retry if wall-clock elapsed since t_start has passed this point;
+# retrying would risk exceeding the 20s grader deadline.
+_RETRY_DEADLINE = 14.0
+
+def _call_llm(prompt: str, client: ollama.Client, t_start: float, max_retries: int = 2) -> str:
     for attempt in range(max_retries):
         try:
             response = client.chat(
@@ -351,16 +357,18 @@ def _call_llm(prompt: str, client: ollama.Client, max_retries: int = 2) -> str:
                 format="json",
             )
             content = response.message.content
-            # Retry if empty response
             if not content or not content.strip():
                 raise ValueError("empty response from LLM")
             return content
         except Exception as e:
-            if attempt < max_retries - 1:
+            elapsed = time.perf_counter() - t_start
+            if attempt < max_retries - 1 and elapsed < _RETRY_DEADLINE:
                 wait = 1.0 + random.uniform(0, 0.5)
-                print(f"[LLM] retry {attempt+1}/{max_retries} after {wait:.1f}s — {e}")
+                print(f"[LLM] retry {attempt+1}/{max_retries} after {wait:.1f}s (elapsed {elapsed:.1f}s) — {e}")
                 time.sleep(wait)
             else:
+                if attempt < max_retries - 1:
+                    print(f"[LLM] skipping retry — deadline exceeded ({elapsed:.1f}s)")
                 raise
 
 # ---------------------------------------------------------------------------
@@ -398,11 +406,11 @@ Write a 2-3 sentence recommendation based only on the movie card above.
 
 RULES:
 - Max 460 characters. Always end on a complete sentence.
-- Sentence 1: connect this movie's mood or genre to what the user asked for.
-- Sentence 2: describe the atmosphere, tone, or emotional quality — NOT a specific scene, twist, or character name. No spoilers.
-- Sentence 3: a short, natural closer that ties back to what they said they want. Warm but not pushy.
-- Only use details from the movie card above. Never invent plot events, character names, or reference other films.
-- Write like a person texting a friend. Avoid: "masterpiece", "stunning", "visceral", "cerebral", "you will love", "perfect for you", "put it on".
+- Sentence 1: connect the movie to what the user asked for, and anchor it with at least ONE concrete detail from the card (director name, a lead actor, the setting/era from the overview, or a specific theme from the keywords).
+- Sentence 2: describe the premise, atmosphere, or hook using 1-2 more concrete details from the card (overview/keywords/tagline). You may name characters or setup events that are part of the premise, but NOT endings, twists, or late-act reveals.
+- Sentence 3: a short, natural closer that ties back to what they said they want.
+- Stay grounded in the card's facts — never invent plot events, character names, or reference other films.
+- Write like a person texting a friend. Avoid: "masterpiece", "stunning", "visceral", "cerebral", "you will love", "perfect for you", "put it on", "gem", "hidden".
 - Tone: {tone_instruction}
 
 Respond ONLY with JSON:
@@ -476,7 +484,7 @@ def get_recommendation(preferences: str, history: list[str], history_ids: list[i
             preferences=preferences,
             history_text=history_text,
             movie_list=movie_list,
-        ), _client)
+        ), _client, t_start)
     except Exception as e:
         print(f"[warn] stage 1 failed ({e}) — using fallback")
         return _fallback(candidates.iloc[0])
@@ -504,7 +512,7 @@ def get_recommendation(preferences: str, history: list[str], history_ids: list[i
             preferences=preferences,
             movie_card=_movie_card(selected_row),
             tone_instruction=tone_instruction,
-        ), _client)
+        ), _client, t_start, max_retries=1)
     except Exception as e:
         print(f"[warn] stage 2 failed ({e}) — using overview fallback")
         return _fallback(selected_row)
